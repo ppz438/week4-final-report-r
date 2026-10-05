@@ -1,0 +1,869 @@
+---
+title: "From Raw Data to Predictive Insight: A Comprehensive Data Analysis Report"
+subtitle: "Cleaning, visualization, statistical testing and predictive modeling of the Titanic passenger data in R"
+author: "[Your Name] | [Internship / Organisation] | [Date]"
+output:
+  word_document:
+    fig_width: 6.5
+    fig_height: 3.8
+    fig_caption: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      comment = "#>", dpi = 200)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(pROC)
+library(randomForest)
+library(car)
+
+# One consistent colour language for every figure (colour-blind friendly)
+col_no    <- "#D55E00"   # did not survive
+col_yes   <- "#0072B2"   # survived
+pal_class <- c("1st" = "#0072B2", "2nd" = "#56B4E9", "3rd" = "#E69F00")
+pal_sex   <- c(female = "#CC79A7", male = "#0072B2")
+
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 11.5),
+          plot.subtitle = element_text(colour = "grey35"),
+          legend.position = "bottom",
+          panel.grid.minor = element_blank())
+)
+
+# Small helper functions reused across sections
+skewness  <- function(x) mean((x - mean(x))^3) / sd(x)^3
+cramers_v <- function(tab) {
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+  as.numeric(sqrt(chi / (sum(tab) * (min(dim(tab)) - 1))))
+}
+```
+
+```{=openxml}
+<w:p><w:r><w:br w:type="page"/></w:r></w:p>
+```
+
+# Executive Summary
+
+**Purpose.** This report brings together four stages of analysis of the Titanic passenger data (891 passengers) into one coherent story: preparing messy data, exploring it visually, testing hypotheses statistically, and building a model that predicts survival. The central question throughout is: *who was more likely to survive, and can that be predicted from what was known about each passenger?*
+
+**What was done**
+
+1. **Data preparation.** Missing values were audited and handled with a method matched to each variable (for example, 20% of ages were imputed, while a cabin field that was 77% empty was converted into a "has cabin" indicator rather than guessed). Skewed fares were log-transformed, and numeric and categorical variables were prepared for analysis.
+2. **Visualization.** Ten charts were designed to show trends, patterns and anomalies. This report presents the five most informative.
+3. **Statistical analysis.** Six hypothesis tests, with normality checks, effect sizes and a correction for multiple testing.
+4. **Predictive modeling.** A logistic regression model validated with a train/test split and repeated cross-validation, and compared with a random forest.
+
+**Key findings**
+
+- **Who a passenger was mattered most.** Women survived at 74% versus 19% for men (odds ratio about 12). Boys under 10 survived at 58%, but men aged 10 and over survived at only 12% to 22%.
+- **Ticket class mattered, too.** Survival fell from 63% in first class to 47% in second and 24% in third, and third class had the lowest survival at almost every age.
+- **Simple comparisons can mislead.** Passengers boarding at Cherbourg survived more often (55%), but partly because more of them were first class. Age showed no significant difference in a simple test, yet clearly mattered once other factors were controlled.
+- **Missing information was itself informative.** Passengers with no recorded cabin survived only 30% of the time, largely because a cabin record marks first class.
+- **The final model works reasonably well.** On 178 passengers it had never seen, it reached 81.5% accuracy (95% CI 75.0% to 86.9%) and an AUC of 0.85, against a 61.8% baseline. It identifies non-survivors well (specificity 90%) but misses about a third of survivors (sensitivity 68%).
+
+**Recommendations.** Treat the model as decision *support* for identifying high-risk groups rather than as an automatic decision-maker; invest in better data capture where records are missing; check results for hidden third variables before acting on any single comparison; and extend the work with richer features, flexible age modeling and a cost-based decision threshold (Sections 8 to 10).
+
+```{=openxml}
+<w:p><w:r><w:br w:type="page"/></w:r></w:p>
+```
+
+# 1. Introduction
+
+## 1.1 Background and purpose
+
+Data analysis is most valuable when it moves beyond isolated techniques and connects them into a single chain of reasoning: clean data leads to trustworthy charts, charts suggest hypotheses, hypotheses are tested statistically, and the surviving ideas feed a predictive model. This report documents that complete chain, from raw file to validated model, using R throughout.
+
+The Titanic passenger dataset (a public, widely used teaching dataset) was chosen for four reasons. It is **realistically messy**, with missing values of very different severities; it mixes **numeric and categorical variables**; it contains **skewed variables and outliers**; and it has a clear **yes/no outcome** (survival) that supports both hypothesis testing and classification. Its main limitations are its modest size and its historical nature, so the findings are used to demonstrate and evaluate a method rather than to draw conclusions about modern settings.
+
+## 1.2 Objectives
+
+1. Clean and prepare the raw data with documented, defensible decisions.
+2. Explore the data visually to find trends, patterns and anomalies.
+3. Test specific hypotheses with appropriate statistical methods.
+4. Build and rigorously evaluate a predictive model.
+5. Translate the technical results into insights and implications that a non-technical reader can act on.
+
+## 1.3 How this report is organised
+
+| Section | Content | Builds on |
+|---|---|---|
+| 2. Data and Methodology | Dataset, variables, tools, overall workflow | Starting point |
+| 3. Data Preparation | Missing values, outliers, transformation, encoding | Section 2 |
+| 4. Exploratory Visualization | Charts of trends, patterns and anomalies | The clean data from Section 3 |
+| 5. Statistical Analysis | Normality checks and hypothesis tests | Patterns spotted in Section 4 |
+| 6. Predictive Modeling | Model building, validation, diagnostics | Variables and effects confirmed in Section 5 |
+| 7. Results and Discussion | Integration of findings and business implications | Sections 3 to 6 |
+| 8. Challenges and Lessons Learned | What went wrong, and what it taught | The whole project |
+| 9. Limitations and Future Directions | Caveats and next steps | Sections 7 and 8 |
+| 10. Conclusion | Final summary and recommendations | Everything |
+
+# 2. Data and Methodology
+
+## 2.1 The dataset
+
+The raw file contains 891 passengers and 12 variables.
+
+| Variable | Type | Description |
+|---|---|---|
+| PassengerId | integer | Unique row identifier |
+| Survived | 0 / 1 | Survival outcome (the target) |
+| Pclass | 1 / 2 / 3 | Ticket class, a proxy for wealth |
+| Name | text | Passenger name (contains a title such as Mr or Mrs) |
+| Sex | categorical | male / female |
+| Age | numeric | Age in years |
+| SibSp | integer | Siblings or spouses aboard |
+| Parch | integer | Parents or children aboard |
+| Ticket | text | Ticket number |
+| Fare | numeric | Ticket price |
+| Cabin | text | Cabin number |
+| Embarked | categorical | Port of boarding (C, Q or S) |
+
+## 2.2 Workflow
+
+The analysis follows a single pipeline in which each stage depends on the one before:
+
+**Raw data** -> **Cleaning and preparation** -> **Exploratory visualization** -> **Hypothesis testing** -> **Predictive model** -> **Interpretation and implications**
+
+Key design principles applied throughout:
+
+- **Reproducibility.** All steps are scripted in R; the raw data is never overwritten, and random processes use a fixed seed.
+- **Method matched to data.** Each cleaning or testing decision is justified by the properties of the variable (for example, rank-based tests for skewed data).
+- **Honest uncertainty.** Effect sizes and confidence intervals are reported alongside p-values, and sample sizes are shown wherever groups are small.
+
+## 2.3 Tools
+
+R (version 4.3.3) with the packages `dplyr` and `tidyr` (data manipulation), `ggplot2`, `scales` and `patchwork` (visualization), `pROC` (ROC analysis), `randomForest` (benchmark model) and `car` (regression diagnostics). The full session information is in Appendix B.
+
+# 3. Data Preparation
+
+*This section turns the raw file into an analysis-ready dataset. Every later section depends on the decisions made here.*
+
+## 3.1 Loading and auditing the raw data
+
+```{r load}
+# Missing values are stored as empty strings in this file, so tell R to treat
+# both "" and "NA" as missing at import time.
+raw <- read.csv("titanic.csv", stringsAsFactors = FALSE, na.strings = c("", "NA"))
+
+dim(raw)
+sum(duplicated(raw))      # duplicate rows: none, so no records need removing
+```
+
+```{r missing-audit}
+# Audit: how much is missing, and where?
+missing_tbl <- data.frame(
+  variable  = names(raw),
+  n_missing = colSums(is.na(raw)),
+  pct       = round(100 * colMeans(is.na(raw)), 1),
+  row.names = NULL
+) %>% arrange(desc(n_missing))
+
+missing_tbl %>% filter(n_missing > 0)
+```
+
+```{r missing-plot, fig.cap="Figure 1: Percentage of missing values by variable in the raw data.", fig.height=2.6}
+missing_tbl %>%
+  filter(n_missing > 0) %>%
+  ggplot(aes(x = reorder(variable, pct), y = pct)) +
+  geom_col(fill = col_yes, width = 0.6) +
+  geom_text(aes(label = paste0(pct, "%")), hjust = -0.1, size = 3.5) +
+  coord_flip() + ylim(0, 90) +
+  labs(x = NULL, y = "% missing")
+```
+
+Three variables have missing values, at very different severities, so a single blanket rule would be wrong. Each gets its own strategy:
+
+| Variable | Missing | Decision | Rationale |
+|---|---|---|---|
+| Cabin | 687 (77.1%) | Do not impute; create a `HasCabin` flag and a `Deck` field | Imputing three quarters of a column would fabricate data, but the *fact* that a cabin was recorded is informative. |
+| Age | 177 (19.9%) | Impute with the median of passengers sharing the same title and class | Too much to drop; the overall median would blur real differences, for example boys ("Master") versus adult men ("Mr"). |
+| Embarked | 2 (0.2%) | Impute with the most common port | Only two values; the mode is a low-risk choice. |
+
+## 3.2 Feature extraction and imputation
+
+Passenger titles inside the `Name` field are a strong proxy for age and sex, so they are extracted first and used to drive the age imputation.
+
+```{r title}
+df <- raw
+
+# Extract the title (text between the comma and the full stop), then
+# collapse rare titles into broader groups
+df$Title <- sub("^.*, (.*?)\\..*$", "\\1", df$Name)
+df$Title <- case_when(
+  df$Title %in% c("Mlle", "Ms")                      ~ "Miss",
+  df$Title %in% c("Mme")                             ~ "Mrs",
+  df$Title %in% c("Mr", "Mrs", "Miss", "Master")     ~ df$Title,
+  TRUE                                               ~ "Rare"
+)
+table(df$Title)
+```
+
+```{r age-impute}
+age_before     <- df$Age
+overall_median <- median(df$Age, na.rm = TRUE)
+
+# Replace each missing age with the median age of passengers in the same
+# Title x Pclass group
+df <- df %>%
+  group_by(Title, Pclass) %>%
+  mutate(Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age)) %>%
+  ungroup()
+
+df$Age[is.na(df$Age)] <- overall_median    # safety net for any empty group
+sum(is.na(df$Age))
+
+# Did imputation distort the distribution?
+c(mean_before = mean(age_before, na.rm = TRUE), mean_after = mean(df$Age),
+  sd_before   = sd(age_before,   na.rm = TRUE), sd_after   = sd(df$Age))
+```
+
+```{r age-compare, fig.cap="Figure 2: Age distribution before (observed values only) and after imputation.", fig.height=3.6}
+bind_rows(
+  data.frame(Age = age_before[!is.na(age_before)], stage = "Before (observed only)"),
+  data.frame(Age = df$Age,                          stage = "After imputation")
+) %>%
+  ggplot(aes(Age, fill = stage)) +
+  geom_histogram(binwidth = 4, colour = "white") +
+  facet_wrap(~stage, ncol = 1) +
+  scale_fill_manual(values = c(col_yes, "#7fcdbb"), guide = "none") +
+  labs(y = "Count")
+```
+
+The mean barely moves (29.7 to 29.1), but the standard deviation shrinks (14.5 to 13.5), the expected side effect of median imputation. This matters later: any analysis of age inherits some extra uncertainty.
+
+```{r embarked-cabin}
+# Embarked: fill the two blanks with the most common port
+embarked_mode <- names(which.max(table(df$Embarked)))
+df$Embarked[is.na(df$Embarked)] <- embarked_mode
+
+# Cabin: turn the pattern of missingness into usable information
+df$HasCabin <- as.integer(!is.na(df$Cabin))
+df$Deck     <- ifelse(is.na(df$Cabin), "Unknown", substr(df$Cabin, 1, 1))
+df$Cabin    <- NULL
+
+# Convert variables to their proper types and add family size
+df$Survived <- factor(df$Survived, levels = c(0, 1), labels = c("No", "Yes"))
+df$Pclass   <- factor(df$Pclass, levels = 1:3, labels = c("1st", "2nd", "3rd"))
+df$Sex      <- factor(df$Sex, levels = c("female", "male"))
+df$Embarked <- factor(df$Embarked)
+df$Title    <- factor(df$Title)
+df$Deck     <- factor(df$Deck)
+df$FamilySize <- df$SibSp + df$Parch + 1
+
+sum(is.na(df))     # no missing values remain
+```
+
+## 3.3 Outlier detection and transformation
+
+Outliers in the continuous variables were flagged with the standard **IQR rule** (values more than 1.5 interquartile ranges beyond the quartiles).
+
+```{r outliers}
+iqr_bounds <- function(x) {
+  q <- quantile(x, c(.25, .75)); i <- q[2] - q[1]
+  c(lower = unname(q[1] - 1.5 * i), upper = unname(q[2] + 1.5 * i))
+}
+b_age <- iqr_bounds(df$Age); b_fare <- iqr_bounds(df$Fare)
+
+rbind(Age = b_age, Fare = b_fare)
+c(age_outliers  = sum(df$Age  < b_age["lower"]  | df$Age  > b_age["upper"]),
+  fare_outliers = sum(df$Fare < b_fare["lower"] | df$Fare > b_fare["upper"]),
+  fare_over_500 = sum(df$Fare > 500),
+  fare_zero     = sum(df$Fare == 0))
+```
+
+The decisions differed by variable:
+
+- **Age (22 flagged, all above about 60 years):** genuine elderly passengers, so they are **kept**.
+- **Fare (116 flagged, three above 500):** these are real first-class tickets. Removing them would delete exactly the passengers who differ most by class, so instead the skew is reduced with a **log transformation**.
+- **Zero fares (15 passengers):** possibly crew or unrecorded fares, but this cannot be verified, so they are flagged and retained.
+
+```{r fare-log, fig.cap="Figure 3: Fare before and after a log(1 + x) transformation.", fig.height=3}
+df$Fare_log <- log1p(df$Fare)
+
+df %>%
+  select(Fare, Fare_log) %>%
+  pivot_longer(everything(), names_to = "version", values_to = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30, fill = col_yes, colour = "white") +
+  facet_wrap(~version, scales = "free") +
+  labs(x = NULL, y = "Count")
+
+c(skew_Fare = skewness(df$Fare), skew_Fare_log = skewness(df$Fare_log))
+```
+
+The log transform cuts the skewness of fare from 4.77 to 0.39, so the extreme tickets no longer dominate the scale.
+
+## 3.4 Normalisation and encoding
+
+```{r scale-encode}
+# Normalisation: min-max (0 to 1) and z-score versions of the numeric variables
+min_max <- function(x) (x - min(x)) / (max(x) - min(x))
+df$Age_minmax      <- min_max(df$Age)
+df$Fare_log_minmax <- min_max(df$Fare_log)
+df$Age_z           <- as.numeric(scale(df$Age))
+df$Fare_log_z      <- as.numeric(scale(df$Fare_log))
+
+# Encoding categorical variables
+df$Sex_male   <- as.integer(df$Sex == "male")       # binary: 0/1
+df$Pclass_num <- as.integer(df$Pclass)              # ordinal: class has an order
+onehot <- as.data.frame(model.matrix(~ Embarked + Title - 1, data = df))  # nominal
+
+df_encoded <- cbind(
+  df %>% select(PassengerId, Survived, Pclass_num, Sex_male, Age_z, Fare_log_z,
+                SibSp, Parch, FamilySize, HasCabin),
+  onehot)
+dim(df_encoded)
+
+write.csv(df,         "titanic_clean.csv",   row.names = FALSE)
+write.csv(df_encoded, "titanic_encoded.csv", row.names = FALSE)
+```
+
+**Why these choices.** Sex is binary, so one 0/1 column suffices. Class is ordinal, so integer coding preserves its ranking. Port and title are nominal, so one-hot encoding avoids implying a false order. The raw-unit columns are kept next to the scaled ones: raw units are used for interpretation in the charts and tests, and the scaled versions are reserved for distance-based modeling.
+
+**Outcome of this stage.** A complete dataset of 891 passengers with no missing values, documented decisions for every variable, and several new features (`Title`, `HasCabin`, `Deck`, `FamilySize`, `Fare_log`) that the later sections build on.
+
+# 4. Exploratory Visualization
+
+*With clean data in hand, charts are used to look for trends, patterns and anomalies. Each finding below becomes a hypothesis tested in Section 5.*
+
+```{r viz-prep}
+df$Port <- factor(df$Embarked, levels = c("C", "Q", "S"),
+                  labels = c("Cherbourg", "Queenstown", "Southampton"))
+df$AgeBand <- cut(df$Age, breaks = c(0, 10, 20, 30, 40, 50, 60, 100), right = FALSE,
+                  labels = c("0-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60+"))
+round(100 * prop.table(table(df$Survived)), 1)    # overall survival rate
+```
+
+## 4.1 Who survived? Survival by passenger title
+
+A lollipop chart compares a few categories by a single percentage. The title (Mr, Mrs, Miss, Master) combines sex, age and marital status, so it summarises "who the person was" better than any single column.
+
+```{r viz-title, fig.cap="Figure 4: Survival rate by passenger title.", fig.height=3.2}
+title_tbl <- df %>% group_by(Title) %>%
+  summarise(n = n(), rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(title_tbl, aes(x = reorder(Title, rate), y = rate)) +
+  geom_segment(aes(xend = Title, y = 0, yend = rate), colour = "grey65") +
+  geom_point(size = 5, colour = col_yes) +
+  geom_text(aes(label = paste0(percent(rate, accuracy = 1), "  (n = ", n, ")")),
+            hjust = -0.25, size = 3.4) +
+  coord_flip() + scale_y_continuous(labels = percent, limits = c(0, 1.05)) +
+  labs(title = "Adult men were far less likely to survive than any other group",
+       subtitle = "'Rare' groups titles such as Dr, Rev and Col",
+       x = NULL, y = "Survival rate")
+```
+
+**What it shows.** Married women (Mrs, 79%) and unmarried women (Miss, 70%) survived most often, boys (Master, 58%) came next, and adult men (Mr) survived only about 16% of the time. The pattern is consistent with a "women and children first" evacuation. The "Rare" group (35%) has only 23 people and should not be over-interpreted.
+
+## 4.2 Does age matter equally for men and women?
+
+A line chart is the right tool for a trend across ordered groups. One line per sex shows whether age affected both sexes in the same way.
+
+```{r viz-age-sex, fig.cap="Figure 5: Survival rate by age group and sex (dot size = number of passengers).", fig.height=3.6}
+sex_age <- df %>% group_by(Sex, AgeBand) %>%
+  summarise(rate = mean(Survived == "Yes"), n = n(), .groups = "drop")
+
+ggplot(sex_age, aes(AgeBand, rate, colour = Sex, group = Sex)) +
+  geom_line(linewidth = 1) + geom_point(aes(size = n)) +
+  scale_size_area(max_size = 6, name = "Passengers") +
+  scale_colour_manual(values = pal_sex) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Women did well at every age; among men, only boys did",
+       x = "Age group (years)", y = "Survival rate")
+```
+
+**What it shows.** Women's survival stays between 63% and 100% in every age group. For men the picture is very different: boys under 10 survived at 58%, but male survival from age 10 onwards sits at only 12% to 22%. So age mattered mainly for males, and mainly at the youngest end. (The 100% for women aged 60 and over rests on just four passengers.)
+
+## 4.3 Where was survival highest and lowest? Class by age
+
+A heatmap packs a two-way table into a single picture, with colour for the survival rate and printed labels for exact values and group sizes.
+
+```{r viz-heat, fig.cap="Figure 6: Survival rate by ticket class and age group.", fig.height=3.4}
+heat <- df %>% group_by(Pclass, AgeBand) %>%
+  summarise(rate = mean(Survived == "Yes"), n = n(), .groups = "drop")
+
+ggplot(heat, aes(AgeBand, Pclass, fill = rate)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = paste0(round(100 * rate), "%\nn=", n)), size = 3) +
+  scale_fill_gradient2(low = col_no, mid = "#F7F7F7", high = col_yes, midpoint = 0.4,
+                       limits = c(0, 1), breaks = c(0, 0.5, 1), labels = percent,
+                       name = "Survival rate") +
+  scale_y_discrete(limits = rev) +
+  labs(title = "Third class was the coldest zone at almost every age",
+       x = "Age group (years)", y = "Ticket class")
+```
+
+**What it shows.** In third class, survival stays below 46% in every age group, falling to 6% for ages 40 to 49 (n = 34) and 0% for ages 50 to 59 (n = 6). In first class most groups sit between 53% and 83%, with the oldest group (60+) the exception at 29%. Second-class children under 10 all survived (n = 17).
+
+## 4.4 A warning about hidden variables: the port of boarding
+
+Passengers boarded at three ports and survival differed by port. Placing a survival chart beside a class-mix chart tests whether the port itself matters or is standing in for something else.
+
+```{r viz-port, fig.cap="Figure 7: Survival rate (left) and class mix (right) by port of boarding.", fig.height=3.6}
+p_a <- df %>% group_by(Port) %>%
+  summarise(rate = mean(Survived == "Yes"), n = n(), .groups = "drop") %>%
+  ggplot(aes(Port, rate)) +
+  geom_col(fill = col_yes, width = 0.6) +
+  geom_text(aes(label = paste0(percent(rate, accuracy = 1), "\n(n = ", n, ")")),
+            vjust = -0.2, size = 3.2) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.7)) +
+  labs(title = "Survival rate", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(size = 8))
+
+p_b <- ggplot(df, aes(Port, fill = Pclass)) +
+  geom_bar(position = "fill", width = 0.6) +
+  scale_y_continuous(labels = percent) + scale_fill_manual(values = pal_class) +
+  labs(title = "Class mix", x = NULL, y = NULL, fill = "Class") +
+  theme(axis.text.x = element_text(size = 8))
+
+p_a + p_b + plot_annotation(title = "Cherbourg survived more, partly because more were first class")
+
+round(100 * prop.table(table(df$Port, df$Pclass), 1), 1)         # class mix by port
+round(100 * tapply(df$Survived == "Yes", list(df$Port, df$Pclass), mean), 1)  # survival within class
+```
+
+**What it shows.** Cherbourg had the highest survival rate (55%) against 39% at Queenstown and 34% at Southampton. But 51% of Cherbourg passengers were first class versus 20% at Southampton, so part of the gap is class mix. It is not the whole story: even within the same class Cherbourg did better than Southampton (69% versus 59% in first class, 38% versus 19% in third). The Queenstown first-class figures rest on only two passengers and should be ignored. This is a textbook case of why a simple comparison can hide a third variable.
+
+## 4.5 Missing information as a signal: survival by deck
+
+```{r viz-deck, fig.cap="Figure 8: Survival rate by deck (grey = no cabin recorded).", fig.height=3.3}
+deck_tbl <- df %>% filter(Deck != "T") %>%     # only 1 passenger, omitted
+  mutate(Deck = factor(Deck, levels = c(LETTERS[1:7], "Unknown"))) %>%
+  group_by(Deck) %>%
+  summarise(rate = mean(Survived == "Yes"), n = n(), .groups = "drop")
+
+ggplot(deck_tbl, aes(Deck, rate, fill = Deck == "Unknown")) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0(percent(rate, accuracy = 1), "\nn=", n)),
+            vjust = -0.2, size = 3) +
+  scale_fill_manual(values = c(`TRUE` = "grey60", `FALSE` = col_yes)) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.95)) +
+  labs(title = "Passengers with no recorded cabin fared much worse",
+       x = "Deck", y = "Survival rate")
+
+round(100 * prop.table(table(HasCabin = df$HasCabin, Class = df$Pclass), 2), 1)
+```
+
+**What it shows.** Passengers with no recorded cabin survived 30% of the time (n = 687), while those on decks B, D and E survived about 75%. But a recorded cabin is largely a marker of first class: 82% of first-class passengers had one versus 2% in third class. So the chart mostly restates the class effect rather than revealing a separate "deck effect", and it shows how a *data-quality problem* (missing cabins) can carry real information.
+
+**Outcome of this stage.** Five patterns worth testing formally: a strong sex effect, a class effect, an age pattern that depends on sex, apparent differences by port, and the information carried by cabin records. Section 5 tests the first three and Section 6 models all of them together. (Further charts, including histograms, scatter plots, a lattice box plot and a mosaic plot, are in the separate Week 2 report.)
+
+# 5. Statistical Analysis
+
+*The charts suggest patterns, but a pattern in a chart can be chance. This section tests the key ones formally.*
+
+## 5.1 Checking assumptions: normality
+
+Many classical tests assume roughly normal data, so the three continuous variables were checked first.
+
+```{r normality}
+norm_tbl <- data.frame(
+  variable  = c("Age", "Fare", "Fare_log"),
+  skewness  = round(c(skewness(df$Age), skewness(df$Fare), skewness(df$Fare_log)), 2),
+  shapiro_W = round(c(shapiro.test(df$Age)$statistic, shapiro.test(df$Fare)$statistic,
+                      shapiro.test(df$Fare_log)$statistic), 3),
+  shapiro_p = format.pval(c(shapiro.test(df$Age)$p.value, shapiro.test(df$Fare)$p.value,
+                            shapiro.test(df$Fare_log)$p.value), digits = 3)
+)
+norm_tbl
+```
+
+The Shapiro-Wilk test rejects normality for all three variables, but with 891 observations it flags even small departures, so skewness and Q-Q plots (shown in the Week 3 report) matter more. `Fare` is severely non-normal, and `Fare_log` improves but is not normal either, because many passengers paid identical ticket prices. **Decision:** use rank-based (non-parametric) tests for fare, and as a cross-check for age.
+
+## 5.2 Hypothesis tests
+
+All tests use alpha = 0.05, with **Holm** adjustment because six tests are run together.
+
+```{r tests}
+# 1 and 2: categorical vs categorical -> chi-square
+tab_sex <- table(df$Sex, df$Survived);    t1 <- chisq.test(tab_sex)
+tab_cls <- table(df$Pclass, df$Survived); t2 <- chisq.test(tab_cls)
+# 3: age by survival -> Welch t-test, cross-checked with Wilcoxon
+t3  <- t.test(Age ~ Survived, data = df)
+w3  <- wilcox.test(Age ~ Survived, data = df)
+# 4: fare by survival -> Wilcoxon rank-sum (fare is heavily skewed)
+t4  <- wilcox.test(Fare ~ Survived, data = df)
+# 5: age across the three classes -> Kruskal-Wallis
+t5  <- kruskal.test(Age ~ Pclass, data = df)
+# 6: age vs fare -> Spearman rank correlation
+t6  <- cor.test(df$Age, df$Fare, method = "spearman", exact = FALSE)
+
+# Effect sizes: how BIG is each effect, not just whether it is "significant"
+d_cohen <- function(x, g) {
+  a <- x[g == levels(g)[1]]; b <- x[g == levels(g)[2]]
+  sp <- sqrt(((length(a) - 1) * var(a) + (length(b) - 1) * var(b)) / (length(a) + length(b) - 2))
+  (mean(b) - mean(a)) / sp
+}
+n_no <- sum(df$Survived == "No"); n_yes <- sum(df$Survived == "Yes")
+cles <- 1 - unname(t4$statistic) / (n_no * n_yes)   # P(survivor paid more)
+
+p_raw <- c(t1$p.value, t2$p.value, t3$p.value, t4$p.value, t5$p.value, t6$p.value)
+test_summary <- data.frame(
+  Test = c("1. Sex vs survival (chi-square)", "2. Class vs survival (chi-square)",
+           "3. Age by survival (Welch t-test)", "4. Fare by survival (Wilcoxon)",
+           "5. Age by class (Kruskal-Wallis)", "6. Age vs fare (Spearman)"),
+  Statistic = c(sprintf("chi2 = %.1f", t1$statistic), sprintf("chi2 = %.1f", t2$statistic),
+                sprintf("t = %.2f", t3$statistic), sprintf("W = %.0f", t4$statistic),
+                sprintf("H = %.1f", t5$statistic), sprintf("rho = %.2f", t6$estimate)),
+  p_holm = format.pval(p.adjust(p_raw, "holm"), digits = 3),
+  Effect_size = c(sprintf("Cramer's V = %.2f", cramers_v(tab_sex)),
+                  sprintf("Cramer's V = %.2f", cramers_v(tab_cls)),
+                  sprintf("Cohen's d = %.2f", d_cohen(df$Age, df$Survived)),
+                  sprintf("P(survivor paid more) = %.2f", cles),
+                  sprintf("epsilon-sq = %.2f", unname(t5$statistic) / (nrow(df) - 1)),
+                  sprintf("rho = %.2f", t6$estimate)),
+  Decision = ifelse(p.adjust(p_raw, "holm") < 0.05, "Reject H0", "Fail to reject H0")
+)
+knitr::kable(test_summary, col.names = c("Test", "Statistic", "Adjusted p (Holm)", "Effect size", "Decision"))
+```
+
+**Interpretation**
+
+1. **Sex and survival (reject H0).** A very strong association with a large effect (Cramer's V = 0.54). Women survived at 74% versus 19% for men; the odds of survival for women were about 12 times those for men (odds ratio 12.3, 95% CI 8.8 to 17.4).
+2. **Class and survival (reject H0).** Survival fell from 63% in first class to 47% in second and 24% in third (Cramer's V = 0.34, a medium-to-large effect).
+3. **Age and survival (fail to reject H0).** Mean ages were 29.8 for non-survivors and 28.1 for survivors; the t-test (p = 0.067) and Wilcoxon test (p = 0.216) fall short of significance and the effect is small. **This does not mean age is irrelevant.** Section 4.2 showed that age matters mainly for young boys and differs by sex, so a comparison of overall averages hides it.
+4. **Fare and survival (reject H0).** Median fare was 26.0 for survivors versus 10.5 for non-survivors, and there is a 69% chance that a randomly chosen survivor paid more than a randomly chosen non-survivor.
+5. **Age across classes (reject H0).** Age differs by class, and all pairwise comparisons stay significant after Holm correction, matching the rising median age by class.
+6. **Age and fare (reject H0, but weak).** Rho is only 0.17, so age explains about 3% of the variation in fare ranks. This is significant but small.
+
+**Statistical versus practical significance.** With 891 passengers, even tiny effects can reach p < 0.001. That is why every result is reported with an effect size: the sex and class effects are both statistically significant and large in practice, whereas the age-fare correlation is significant but too weak to matter much.
+
+**Outcome of this stage.** The strong effects seen in the charts (sex, class, fare) are confirmed as real, and the one surprise (no overall age effect) is explained by the interaction with sex. These results decide what goes into the model.
+
+# 6. Predictive Modeling
+
+*Tests ask whether one variable matters. Modeling asks how well all of them together predict the outcome for passengers the model has never seen.*
+
+## 6.1 Design: split, candidates and validation
+
+The data is split 80/20 (stratified so both parts keep the same survival rate). The **training set** is used for all fitting and model selection, and the **test set** is touched only once at the end, to give an honest estimate of performance on unseen data.
+
+```{r split}
+model_df <- df %>%
+  select(Survived, Pclass, Sex, Age, SibSp, Parch, Fare_log, Embarked, HasCabin)
+
+set.seed(2026)                      # fixed seed so the split is reproducible
+idx <- unlist(lapply(split(seq_len(nrow(model_df)), model_df$Survived),
+                     function(i) sample(i, size = round(0.8 * length(i)))))
+train <- model_df[idx, ]
+test  <- model_df[-idx, ]
+
+c(train = nrow(train), test = nrow(test))
+max(prop.table(table(train$Survived)))     # baseline: always predict "No"
+```
+
+Three candidate models are compared:
+
+- **Model 1:** logistic regression with main effects of all predictors.
+- **Model 2:** Model 1 plus a **Sex x Class interaction**, motivated by Sections 4 and 5 (the effect of class appears to differ between men and women).
+- **Random forest:** a flexible benchmark to check whether logistic regression leaves signal on the table.
+
+They are compared with **repeated stratified 10-fold cross-validation on the training set only**: each tenth of the data is held out in turn while the model is fitted on the rest, repeated three times. The metrics are accuracy and **AUC** (how well the model ranks survivors above non-survivors, where 0.5 is guessing and 1.0 is perfect). The helper functions are listed in Appendix A.
+
+```{r cv-functions, echo=FALSE}
+auc_fn <- function(y, p) {
+  as.numeric(auc(roc(y, p, levels = c("No", "Yes"), direction = "<", quiet = TRUE)))
+}
+
+fit_predict <- function(type, formula, trn, tst) {
+  if (type == "glm") {
+    m <- glm(formula, data = trn, family = binomial)
+    predict(m, newdata = tst, type = "response")
+  } else {
+    m <- randomForest(formula, data = trn, ntree = 500)
+    predict(m, newdata = tst, type = "prob")[, "Yes"]
+  }
+}
+
+cv_eval <- function(type, formula, data, k = 10, reps = 3, seed = 2026) {
+  set.seed(seed)
+  out <- vector("list", k * reps); n <- 0
+  for (r in seq_len(reps)) {
+    folds <- integer(nrow(data))
+    for (cl in levels(data$Survived)) {                 # stratified fold assignment
+      ii <- which(data$Survived == cl)
+      folds[ii] <- sample(rep(seq_len(k), length.out = length(ii)))
+    }
+    for (f in seq_len(k)) {
+      trn <- data[folds != f, ]; tst <- data[folds == f, ]
+      p <- fit_predict(type, formula, trn, tst)
+      n <- n + 1
+      out[[n]] <- data.frame(auc = auc_fn(tst$Survived, p),
+                             acc = mean((p >= 0.5) == (tst$Survived == "Yes")))
+    }
+  }
+  bind_rows(out)
+}
+```
+
+```{r cv-run}
+f1 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare_log + Embarked + HasCabin
+f2 <- update(f1, . ~ . + Sex:Pclass)
+
+cv_res <- list(
+  "Model 1: logistic (main effects)"  = cv_eval("glm", f1, train),
+  "Model 2: logistic (+ Sex x Class)" = cv_eval("glm", f2, train),
+  "Random forest (benchmark)"         = cv_eval("rf",  f1, train)
+)
+cv_tbl <- bind_rows(lapply(names(cv_res), function(nm) {
+  r <- cv_res[[nm]]
+  data.frame(model = nm,
+             auc_mean = round(mean(r$auc), 3), auc_sd = round(sd(r$auc), 3),
+             acc_mean = round(mean(r$acc), 3), acc_sd = round(sd(r$acc), 3))
+}))
+knitr::kable(cv_tbl, col.names = c("Model", "AUC (mean)", "AUC (SD)", "Accuracy (mean)", "Accuracy (SD)"))
+
+# Is the interaction statistically justified? Likelihood-ratio test and AIC
+m1_tr <- glm(f1, data = train, family = binomial)
+m2_tr <- glm(f2, data = train, family = binomial)
+anova(m1_tr, m2_tr, test = "Chisq")
+AIC(m1_tr, m2_tr)
+```
+
+**Model choice.** The three models score similarly (AUC 0.865, 0.869 and 0.877), and differences of about 0.01 are small compared with fold-to-fold variation (standard deviation about 0.05). **Model 2 is chosen** because the interaction is strongly supported (deviance drop of 26.9 on 2 degrees of freedom, p < 0.001; AIC falls from 628.4 to 605.6), it has the higher cross-validated AUC and accuracy of the two logistic models, and it stays fully interpretable. The random forest is nominally best but its edge is within the noise, and it cannot be explained as simply, so it is kept as a benchmark only.
+
+## 6.2 The final model: what drives survival?
+
+```{r final-fit}
+final_model <- glm(f2, data = train, family = binomial)
+
+# Exponentiate coefficients into odds ratios (>1 = higher odds of survival)
+or_tbl <- exp(cbind(OR = coef(final_model), confint(final_model)))
+round(or_tbl, 3)
+```
+
+Because the model includes an interaction, the `Sexmale` and `Pclass` rows describe the reference group (first-class women) and should not be read as overall effects. The effects that can be read directly are:
+
+- **Age:** each extra year multiplies the odds of survival by 0.95 (CI 0.93 to 0.97), about 42% lower odds per 10 years.
+- **Siblings or spouses aboard:** each additional one multiplies the odds by 0.65 (CI 0.49 to 0.83), about 35% lower.
+- **Recorded cabin:** multiplies the odds by 3.7 (CI 1.6 to 8.9).
+- **Port:** boarding at Southampton rather than Cherbourg multiplies the odds by 0.48 (CI 0.28 to 0.82), so the port gap seen in Section 4.4 persists even after accounting for class.
+- **Interaction:** being male lowered the odds in every class, but the penalty is smaller, in odds terms, in third class than in first (interaction odds ratio 5.2, wide CI 1.5 to 25.4).
+- **Parch and Fare_log** are not significant once other variables are included, because their information overlaps with class, cabin and family size.
+
+An important link to earlier sections: **age**, which showed no significant effect in the simple test (Section 5.2), becomes clearly significant here once sex, class and the other variables are controlled. This is exactly the kind of insight a multi-variable model provides and a single test cannot.
+
+## 6.3 Performance on unseen data
+
+```{r test-eval}
+# Apply the final model ONCE to the held-out test set
+test$p    <- predict(final_model, newdata = test, type = "response")
+test$pred <- factor(ifelse(test$p >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+cm <- table(Predicted = test$pred, Actual = test$Survived)
+cm
+
+tp <- cm["Yes", "Yes"]; tn <- cm["No", "No"]; fp <- cm["Yes", "No"]; fn <- cm["No", "Yes"]
+acc_ci  <- binom.test(tp + tn, sum(cm))
+roc_obj <- roc(test$Survived, test$p, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+
+perf <- data.frame(
+  metric = c("Accuracy", "Accuracy 95% CI (low)", "Accuracy 95% CI (high)",
+             "Sensitivity (recall)", "Specificity", "Precision", "F1 score", "AUC",
+             "AUC 95% CI (low)", "AUC 95% CI (high)", "Baseline accuracy"),
+  value = round(c((tp + tn) / sum(cm), acc_ci$conf.int[1], acc_ci$conf.int[2],
+                  tp / (tp + fn), tn / (tn + fp), tp / (tp + fp),
+                  2 * tp / (2 * tp + fp + fn), as.numeric(auc(roc_obj)),
+                  ci.auc(roc_obj)[1], ci.auc(roc_obj)[3],
+                  max(prop.table(table(test$Survived)))), 3)
+)
+knitr::kable(perf, col.names = c("Metric", "Value"))
+```
+
+On 178 unseen passengers the model classified **81.5%** correctly (95% CI 75.0% to 86.9%), well above the 61.8% obtained by always predicting "did not survive". The **AUC of 0.850** (CI 0.787 to 0.914) means a randomly chosen survivor is ranked above a randomly chosen non-survivor 85% of the time. These figures are close to the cross-validated results on the training data (accuracy 81.8%, AUC 0.869), which suggests the model is not seriously overfitted.
+
+The model is better at recognising non-survivors (specificity 90.0%) than survivors (sensitivity 67.6%): of the 68 actual survivors it missed 22, while only 11 of the 110 non-survivors were wrongly predicted to survive. When it predicts survival, it is right 80.7% of the time.
+
+## 6.4 Diagnostics: can the model be trusted?
+
+```{r diag-cm-roc, fig.cap="Figure 9: Confusion matrix (left) and ROC curve (right) on the test set.", fig.height=3.4}
+p_cm <- ggplot(as.data.frame(cm), aes(Actual, Predicted, fill = Freq)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#F0F6FB", high = col_yes, guide = "none") +
+  labs(title = "Confusion matrix")
+
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_line(colour = col_yes, linewidth = 1) +
+  annotate("text", x = 0.65, y = 0.15, size = 4,
+           label = paste0("AUC = ", round(as.numeric(auc(roc_obj)), 3))) +
+  labs(title = "ROC curve", x = "False positive rate", y = "True positive rate")
+
+p_cm + p_roc
+```
+
+```{r diag-calib, fig.cap="Figure 10: Calibration plot on the test set (n = passengers per bin).", fig.height=3.3}
+# Calibration: do predicted probabilities match observed survival rates?
+calib <- test %>% mutate(bin = ntile(p, 5)) %>% group_by(bin) %>%
+  summarise(pred = mean(p), obs = mean(Survived == "Yes"), n = n(), .groups = "drop")
+
+ggplot(calib, aes(pred, obs)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_line(colour = col_yes) + geom_point(colour = col_yes, size = 3) +
+  geom_text(aes(label = paste0("n=", n)), vjust = 1.8, size = 3) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Predicted vs observed survival",
+       x = "Mean predicted probability", y = "Observed survival rate")
+```
+
+```{r diag-resid, fig.cap="Figure 11: Binned residual plot on the training set (dashed lines = approximate 95% bounds).", fig.height=3.3}
+# Binned residuals: average residual per group of similar fitted probability
+tr <- train
+tr$p   <- fitted(final_model)
+tr$res <- as.numeric(tr$Survived == "Yes") - tr$p
+binned <- tr %>% mutate(bin = ntile(p, 25)) %>% group_by(bin) %>%
+  summarise(mean_p = mean(p), mean_res = mean(res),
+            bound = 2 * sqrt(mean(p * (1 - p)) / n()), .groups = "drop")
+
+ggplot(binned, aes(mean_p, mean_res)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_line(aes(y = bound), linetype = "dashed", colour = col_no) +
+  geom_line(aes(y = -bound), linetype = "dashed", colour = col_no) +
+  geom_point(colour = col_yes, size = 2) +
+  labs(title = "Binned residuals vs fitted probability",
+       x = "Mean fitted probability", y = "Mean residual")
+
+mean(abs(binned$mean_res) > binned$bound)   # share of bins outside the bounds
+```
+
+```{r diag-other}
+cd <- cooks.distance(final_model)                       # influential observations
+c(n_above_4_over_n = sum(cd > 4 / length(cd)), max_cooks = round(max(cd), 3))
+
+vif(m1_tr)                                              # multicollinearity (main-effects model)
+
+# Linearity of age on the log-odds scale: does adding Age^2 improve the fit?
+anova(final_model, update(final_model, . ~ . + I(Age^2)), test = "Chisq")
+```
+
+| Check | Result | Verdict |
+|---|---|---|
+| ROC curve | Rises steeply, well above the diagonal | Separates survivors from non-survivors far better than chance |
+| Calibration | Largest gaps about 12 points, but only 35 to 36 passengers per bin (standard error about 8 points) | Broadly good; gaps are within sampling noise |
+| Binned residuals | 3 of 25 bins (12%) outside bounds, the largest being positive residuals at low fitted probabilities | Acceptable; model slightly under-predicts survival for some low-probability passengers |
+| Influential points | Largest Cook's distance 0.044 (concern starts at 0.5 to 1) | None dominates; no observation removed |
+| Multicollinearity | Largest adjusted GVIF 1.74 (below about 2) | Class, fare and cabin overlap, but not enough to destabilise estimates |
+| Linearity of age | Adding Age-squared gives p = 0.053 | Borderline; a hint of curvature worth modeling more flexibly |
+
+**Outcome of this stage.** A validated, interpretable model whose main assumptions are reasonably met, whose performance on unseen data matches its cross-validation, and whose limitations (missing a third of survivors, slight under-prediction at the low end) are understood.
+
+# 7. Results and Discussion
+
+## 7.1 Bringing the stages together
+
+Each stage answered a different question, and the answers reinforce one another:
+
+| Stage | Question asked | Main finding | Evidence |
+|---|---|---|---|
+| Preparation | Can the data be trusted? | Yes, after handling 20% missing ages and a 77% empty cabin field with matched strategies | Figures 1 to 3 |
+| Visualization | What patterns exist? | Sex, class and age-by-sex patterns; port and cabin effects partly explained by class | Figures 4 to 8 |
+| Statistical testing | Are the patterns real? | Sex, class and fare effects are large and significant; overall age effect is not | Section 5.2 |
+| Modeling | Can survival be predicted? | Yes: 81.5% accuracy and AUC 0.85 on unseen data | Section 6 |
+
+**Consistency across methods.** The strongest finding, the sex effect, appears three independent ways: as a gap in the charts (74% versus 19%), as a large effect in the hypothesis test (Cramer's V = 0.54, odds ratio about 12), and as the dominant term in the model. When different methods agree, confidence in the result is much higher than any single method could provide.
+
+**Where methods disagreed, and what that taught.** The age result differs across stages: the simple test finds no overall effect, the chart shows an effect concentrated in boys, and the model finds a clear effect once other factors are controlled. Each is correct for the question it asks. This is a reminder that a single summary statistic can hide structure, and that no single method tells the full story.
+
+## 7.2 Patterns and statistical significance in plain language
+
+- **Sex and class were the dominant factors.** Both are statistically significant and large in practical terms, which is the combination that justifies calling a finding important.
+- **Age mattered in a specific way**, mainly at the extremes (children under 10 did best; those in their 20s and over 60 did worst) and differently for men and women.
+- **Several apparent effects were partly artefacts of other variables.** The port effect and the cabin effect both shrink once class is considered, although the port effect does not disappear.
+- **Family size had a non-linear effect** (seen in the Week 1 exploration): small families fared better than solo travellers or very large families, and each additional sibling or spouse was associated with lower odds in the model.
+
+## 7.3 Impacts and business implications
+
+The Titanic data is historical, so the following are framed as **lessons for analytical practice** and as how comparable findings would be used in a modern setting such as passenger safety, emergency planning or customer-risk analysis. They are implications of the method and findings, not claims about any real organisation.
+
+| Finding | Implication in a modern analogue | Caution |
+|---|---|---|
+| Outcomes differed sharply by sex and class (Figures 4 to 6) | Outcome gaps between groups show where safety procedures, resources or communication need to be targeted; they justify an equity audit of the process | The data cannot say *why* the gaps arose |
+| Missing cabin records carried information (Figure 8) | Invest in complete, consistent data capture, and treat missingness as a signal to investigate rather than something to delete | Here missingness proxies for class; elsewhere it may mean something different |
+| Port effect shrank after considering class (Figure 7) | Check for hidden third variables before acting on any single comparison, since a decision based on the port alone would target the wrong thing | Even after adjustment a port effect remained, so it should not be dismissed either |
+| Model reaches AUC 0.85 but misses about a third of survivors | Use the model as decision *support* to flag high-risk groups, with human review, rather than as an automatic decision-maker | A model that misses one in three positives is unsuitable for high-stakes screening on its own |
+| The decision threshold drives the error trade-off | Choose the threshold from the real cost of each error type (missed high-risk case versus false alarm), not by default at 0.5 | Requires cost information that this dataset does not contain |
+| Small sample, wide confidence intervals | Report uncertainty alongside every number, so decision-makers know how far to trust a result | Small differences between models cannot be trusted |
+
+# 8. Challenges and Lessons Learned
+
+## 8.1 Challenges overcome
+
+| Challenge | How it was handled | Lesson |
+|---|---|---|
+| **Very uneven missing data** (0.2% to 77%) | A different strategy for each variable (mode, grouped median, indicator flag) rather than one blanket rule | Match the method to how much is missing and how much the variable matters |
+| **Heavily skewed fare with real outliers** | Kept the outliers (they were genuine) and used a log transform and rank-based tests | Do not delete extreme values just because they are extreme; ask whether they are real |
+| **Imputed ages added hidden uncertainty** | Compared distributions before and after imputation, and flagged the variance reduction | Every imputation has a cost; check it and carry the caveat forward |
+| **A misleading simple test for age** | Combined the test with charts and a multi-variable model to explain the apparent contradiction | A non-significant result is not proof of no effect |
+| **Confounding between class, fare, cabin and port** | Compared survival within classes, checked VIF, and interpreted coefficients carefully | Look for hidden third variables before drawing conclusions |
+| **Honest evaluation with a small dataset** | Held out a test set used only once, repeated cross-validation, and reported confidence intervals | Small data needs more caution, not more optimism |
+
+## 8.2 Lessons learned
+
+1. **Good analysis is a chain, not a set of separate tricks.** Each stage fed the next: cleaning decisions affected the charts, the charts shaped the hypotheses, and the tests decided what went into the model.
+2. **Effect sizes matter as much as p-values.** With enough data almost anything is "significant"; the question is whether the effect is large enough to matter.
+3. **Simple comparisons mislead; combine methods.** The port and age results both looked different depending on the method used.
+4. **Validation protects against self-deception.** The honest test-set result, rather than the training result, is what supports any claim about prediction.
+5. **Interpretability has real value.** A model whose coefficients can be explained (odds ratios) was more useful than a marginally more accurate black box.
+6. **Document decisions as you go.** Being able to say *why* each choice was made is what makes an analysis defensible.
+
+# 9. Limitations and Future Directions
+
+## 9.1 Limitations
+
+- **Small sample.** With about 178 test passengers, performance estimates are uncertain (the AUC interval spans 0.79 to 0.91).
+- **Imputed ages.** About 20% of ages are estimates, which adds noise to every age-related result.
+- **Preprocessing before splitting.** Age imputation used medians from the full dataset. It used no outcome information, so bias is probably small, but a stricter pipeline would impute inside each cross-validation fold.
+- **Association, not causation.** The analysis shows what is linked to survival, not why. Class, fare, cabin and sex are entangled.
+- **Limited information.** The data lacks details such as cabin location or who travelled together, which limits how much any model can learn.
+- **Historical data.** The results describe one event and should not be generalised.
+
+## 9.2 Future directions
+
+1. **Tune the decision threshold** using out-of-fold predictions on the training data and the relative cost of each type of error, to raise the share of survivors detected.
+2. **Model age more flexibly**, using splines or a child indicator, since the Age-squared test hinted at curvature and the charts showed a child effect.
+3. **Engineer richer features**, such as family or travel-group size from surnames and ticket numbers, and test them by cross-validation.
+4. **Try regularised or boosted models** (lasso, elastic net, gradient boosting) and compare them with the current model.
+5. **Strengthen the pipeline**: impute inside each cross-validation fold, use multiple imputation (for example the `mice` package), and use repeated splits or bootstrapping for narrower confidence intervals.
+6. **Recalibrate** the predicted probabilities if they are to be used as risk scores.
+7. **Make the results interactive**, for example with a `shiny` dashboard, so non-technical users can explore the findings and filter by group.
+8. **Apply the same workflow to a current, larger dataset**, so that the method, not just the demonstration, can be validated.
+
+# 10. Conclusion
+
+This report followed a single question, *who survived the Titanic, and can that be predicted?*, through the full life cycle of a data analysis: preparing messy data, exploring it visually, testing hypotheses statistically and building a validated predictive model, all in R.
+
+**The importance of a data-driven approach.** Each stage added something the others could not. Careful preparation made the data trustworthy; visualization revealed patterns no one would have guessed from a spreadsheet; hypothesis testing separated real effects from chance; and modeling showed how much of the outcome could be predicted, and where the predictions fail. Relying on intuition alone would have missed, for example, that the apparent port effect was partly a class effect, or that age matters mainly for boys. A data-driven approach is valuable not because it always gives a confident answer, but because it shows *how* confident to be.
+
+**Main results.** Sex and ticket class were the strongest factors: women survived at 74% versus 19% for men, and survival fell from 63% in first class to 24% in third. The final model, a logistic regression with a Sex x Class interaction, reached 81.5% accuracy and an AUC of 0.85 on passengers it had never seen, against a 61.8% baseline, and its main assumptions were reasonably met.
+
+**Challenges encountered.** Missing data of very different severities, skewed variables with genuine outliers, hidden confounding between variables, and a small dataset that demanded cautious evaluation. Each was addressed with a documented, justified decision rather than a default.
+
+**Recommendations for further analysis.** Use the model as decision support rather than an automatic decision-maker, because it misses about a third of survivors. Tune the decision threshold to the real cost of each type of error, model age more flexibly, add richer features, test regularised and boosted models, and strengthen the pipeline with stricter imputation and repeated validation. Above all, keep reporting uncertainty alongside every result, since an honest estimate of what is not known is part of the analysis, not a weakness of it.
+
+```{=openxml}
+<w:p><w:r><w:br w:type="page"/></w:r></w:p>
+```
+
+# Appendix A: Cross-Validation Helper Functions
+
+These functions run the repeated stratified 10-fold cross-validation used in Section 6.1.
+
+```{r appendix-cv, ref.label="cv-functions", eval=FALSE, echo=TRUE}
+```
+
+# Appendix B: Session Information and Reproducibility
+
+To reproduce this report, place `titanic.csv` (the raw data) in the same folder as the `.Rmd` file and knit it in RStudio. Cleaned data files (`titanic_clean.csv` and `titanic_encoded.csv`) are written automatically.
+
+```{r session}
+sessionInfo()
+```
